@@ -833,6 +833,9 @@ pub struct App {
     #[cfg(all(feature = "profiler", not(target_family = "wasm")))]
     hang_monitor: Option<crate::profiler::hang::HangMonitor>,
     pub(crate) entities: EntityMap,
+    /// The globals each cached view rendering right now has read, innermost
+    /// last. Empty outside a cached view's render, where reads go unrecorded.
+    pub(crate) global_reads: RefCell<Vec<FxHashSet<TypeId>>>,
     pub(crate) new_entity_observers: SubscriberSet<TypeId, NewEntityListener>,
     pub(crate) windows: SlotMap<WindowId, Option<Box<Window>>>,
     pub(crate) window_handles: FxHashMap<WindowId, AnyWindowHandle>,
@@ -970,6 +973,7 @@ impl App {
                 http_client,
                 globals_by_type: Default::default(),
                 entities,
+                global_reads: RefCell::default(),
                 new_entity_observers: SubscriberSet::new(),
                 windows: SlotMap::with_key(),
                 window_update_stack: Vec::new(),
@@ -1393,6 +1397,35 @@ impl App {
             .copied()
             .collect::<FxHashSet<EntityId>>();
         (result, entities_accessed_in_callback)
+    }
+
+    /// Run `callback`, returning the globals it read, nested readers' included.
+    /// The reads also count toward any enclosing call, as entity reads do.
+    pub(crate) fn detect_accessed_globals<R>(
+        &mut self,
+        callback: impl FnOnce(&mut App) -> R,
+    ) -> (R, FxHashSet<TypeId>) {
+        self.global_reads.get_mut().push(FxHashSet::default());
+        let result = callback(self);
+        let reads = self.global_reads.get_mut().pop().unwrap_or_default();
+        self.extend_accessed_globals(&reads);
+        (result, reads)
+    }
+
+    /// Count `globals` as read by every cached view rendering now: a cached
+    /// view replaying its last frame reads what it read then.
+    pub(crate) fn extend_accessed_globals(&mut self, globals: &FxHashSet<TypeId>) {
+        if let Some(reads) = self.global_reads.get_mut().last_mut() {
+            reads.extend(globals.iter().copied());
+        }
+    }
+
+    fn note_global_read(&self, global_type: TypeId) {
+        if let Ok(mut reads) = self.global_reads.try_borrow_mut()
+            && let Some(reads) = reads.last_mut()
+        {
+            reads.insert(global_type);
+        }
     }
 
     pub(crate) fn record_entities_accessed(
@@ -2221,6 +2254,11 @@ impl App {
 
     fn apply_notify_global_observers_effect(&mut self, type_id: TypeId) {
         self.pending_global_notifications.remove(&type_id);
+        for window in self.windows.values_mut() {
+            if let Some(window) = window.as_deref_mut() {
+                window.invalidate_global_readers(type_id);
+            }
+        }
         self.global_observers
             .clone()
             .retain(&type_id, |observer| observer(self));
@@ -2461,12 +2499,14 @@ impl App {
 
     /// Check whether a global of the given type has been assigned.
     pub fn has_global<G: Global>(&self) -> bool {
+        self.note_global_read(TypeId::of::<G>());
         self.globals_by_type.contains_key(&TypeId::of::<G>())
     }
 
     /// Access the global of the given type. Panics if a global for that type has not been assigned.
     #[track_caller]
     pub fn global<G: Global>(&self) -> &G {
+        self.note_global_read(TypeId::of::<G>());
         self.globals_by_type
             .get(&TypeId::of::<G>())
             .map(|any_state| any_state.downcast_ref::<G>().unwrap())
@@ -2475,6 +2515,7 @@ impl App {
 
     /// Access the global of the given type if a value has been assigned.
     pub fn try_global<G: Global>(&self) -> Option<&G> {
+        self.note_global_read(TypeId::of::<G>());
         self.globals_by_type
             .get(&TypeId::of::<G>())
             .map(|any_state| any_state.downcast_ref::<G>().unwrap())

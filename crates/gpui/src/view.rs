@@ -329,6 +329,7 @@ struct ViewElementState {
     paint_range: Range<PaintIndex>,
     cache_key: ViewElementCacheKey,
     accessed_entities: FxHashSet<EntityId>,
+    accessed_globals: FxHashSet<TypeId>,
 }
 
 struct ViewElementCacheKey {
@@ -559,6 +560,7 @@ fn prepaint_view(
                     window.reuse_prepaint(element_state.prepaint_range.clone());
                     cx.entities
                         .extend_accessed(&element_state.accessed_entities);
+                    cx.extend_accessed_globals(&element_state.accessed_globals);
                     let prepaint_end = window.prepaint_index();
                     let replayed = prepaint_start..prepaint_end;
                     rebase_nested_views(window, &replayed, |nested| {
@@ -574,6 +576,10 @@ fn prepaint_view(
                     element_state.frame = window.frames_drawn;
                     element_state.prepaint_range = replayed;
                     window.record_cached_view_reads(entity_id, &element_state.accessed_entities);
+                    window.record_cached_view_global_reads(
+                        entity_id,
+                        &element_state.accessed_globals,
+                    );
 
                     return (None, element_state);
                 }
@@ -583,21 +589,30 @@ fn prepaint_view(
                 // dirty, so whatever is still clean replays its last frame,
                 // exactly as it would under an uncached parent.
                 let prepaint_start = window.prepaint_index();
-                let (element, accessed_entities) = cx.detect_accessed_entities(|cx| {
-                    let mut element = render(window, cx);
-                    element.layout_as_root(Size::<AvailableSpace>::from(bounds.size), window, cx);
-                    element.prepaint_at(bounds.origin, window, cx);
-                    element
-                });
+                let ((element, accessed_entities), accessed_globals) =
+                    cx.detect_accessed_globals(|cx| {
+                        cx.detect_accessed_entities(|cx| {
+                            let mut element = render(window, cx);
+                            element.layout_as_root(
+                                Size::<AvailableSpace>::from(bounds.size),
+                                window,
+                                cx,
+                            );
+                            element.prepaint_at(bounds.origin, window, cx);
+                            element
+                        })
+                    });
 
                 let prepaint_end = window.prepaint_index();
                 window.record_cached_view_reads(entity_id, &accessed_entities);
+                window.record_cached_view_global_reads(entity_id, &accessed_globals);
 
                 (
                     Some(element),
                     ViewElementState {
                         frame: window.frames_drawn,
                         accessed_entities,
+                        accessed_globals,
                         prepaint_range: prepaint_start..prepaint_end,
                         paint_range: PaintIndex::default()..PaintIndex::default(),
                         cache_key: ViewElementCacheKey {

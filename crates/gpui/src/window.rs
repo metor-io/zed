@@ -1070,6 +1070,8 @@ pub(crate) struct Frame {
     /// view stays current with every entity it renders from, not only its
     /// own (`Window::invalidate_entities`).
     pub(crate) cached_view_reads: FxHashMap<EntityId, SmallVec<[EntityId; 2]>>,
+    /// For each global, the cached views that read it while rendering.
+    pub(crate) cached_view_global_reads: FxHashMap<TypeId, SmallVec<[EntityId; 2]>>,
 }
 
 #[derive(Clone, Default)]
@@ -1213,6 +1215,7 @@ impl Frame {
             inspector_hitboxes: FxHashMap::default(),
             tab_stops: TabStopMap::default(),
             cached_view_reads: FxHashMap::default(),
+            cached_view_global_reads: FxHashMap::default(),
         }
     }
 
@@ -1230,6 +1233,7 @@ impl Frame {
         self.deferred_draws.clear();
         self.tab_stops.clear();
         self.cached_view_reads.clear();
+        self.cached_view_global_reads.clear();
         self.focus = None;
 
         #[cfg(any(test, feature = "test-support"))]
@@ -3736,6 +3740,37 @@ impl Window {
                     .push(view);
             }
         }
+    }
+
+    /// Record that the cached view `view` read `globals` while rendering.
+    pub(crate) fn record_cached_view_global_reads(
+        &mut self,
+        view: EntityId,
+        globals: &FxHashSet<TypeId>,
+    ) {
+        for &global in globals {
+            self.next_frame
+                .cached_view_global_reads
+                .entry(global)
+                .or_default()
+                .push(view);
+        }
+    }
+
+    /// A global changed: the cached views that read it render again.
+    pub(crate) fn invalidate_global_readers(&mut self, global: TypeId) {
+        let Some(readers) = self
+            .rendered_frame
+            .cached_view_global_reads
+            .get(&global)
+            .cloned()
+        else {
+            return;
+        };
+        for view in readers {
+            self.mark_view_dirty(view);
+        }
+        self.invalidator.set_dirty(true);
     }
 
     #[profiling::function]
@@ -10216,6 +10251,82 @@ mod inspector_tests {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             self.renders += 1;
             div().size(px(10.)).bg(crate::blue()).child("inner")
+        }
+    }
+
+    /// A cached view that read a global re-renders when the global changes;
+    /// a cached sibling that never read it stays cached.
+    #[gpui::test]
+    fn test_cached_view_follows_globals_it_reads(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_global(Counter(0)));
+        let window = cx.add_window(|_, cx| GlobalRoot {
+            reader: cx.new(|_| GlobalReader { renders: 0 }),
+            other: cx.new(|_| NestInner { renders: 0 }),
+        });
+        let renders = |cx: &mut TestAppContext| {
+            let root = window.root(cx).unwrap();
+            cx.read(|cx| {
+                let root = root.read(cx);
+                (root.reader.read(cx).renders, root.other.read(cx).renders)
+            })
+        };
+        let draw = |cx: &mut TestAppContext| {
+            cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+                .unwrap()
+        };
+
+        draw(cx);
+        draw(cx);
+        let settled = renders(cx);
+
+        cx.update(|cx| cx.update_global::<Counter, _>(|counter, _| counter.0 += 1));
+        draw(cx);
+        assert_eq!(
+            renders(cx),
+            (settled.0 + 1, settled.1),
+            "only the reader of the global renders again"
+        );
+
+        draw(cx);
+        assert_eq!(
+            renders(cx),
+            (settled.0 + 1, settled.1),
+            "then both stay cached"
+        );
+    }
+
+    struct Counter(u32);
+    impl Global for Counter {}
+
+    struct GlobalRoot {
+        reader: Entity<GlobalReader>,
+        other: Entity<NestInner>,
+    }
+
+    impl Render for GlobalRoot {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .child(
+                    self.reader
+                        .clone()
+                        .cached(StyleRefinement::default().size(px(10.))),
+                )
+                .child(
+                    self.other
+                        .clone()
+                        .cached(StyleRefinement::default().size(px(10.))),
+                )
+        }
+    }
+
+    struct GlobalReader {
+        renders: usize,
+    }
+
+    impl Render for GlobalReader {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            self.renders += 1;
+            div().size(px(cx.global::<Counter>().0 as f32 + 1.))
         }
     }
 
