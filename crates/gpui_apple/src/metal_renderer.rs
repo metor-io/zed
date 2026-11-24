@@ -128,6 +128,9 @@ pub struct MetalRenderer {
     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
     surfaces_pipeline_state: metal::RenderPipelineState,
     bgra_surfaces_pipeline_state: metal::RenderPipelineState,
+    /// CoreVideo textures encoded into the frame being built, released with
+    /// its command buffer: the GPU reads them after `draw_surfaces` returns.
+    surface_textures: Vec<CFRetained<CVMetalTexture>>,
     unit_vertices: metal::Buffer,
     #[allow(clippy::arc_with_non_send_sync)]
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
@@ -438,6 +441,7 @@ impl MetalRenderer {
             polychrome_sprites_pipeline_state,
             surfaces_pipeline_state,
             bgra_surfaces_pipeline_state,
+            surface_textures: Vec::new(),
             unit_vertices,
             instance_buffer_pool,
             sprite_atlas,
@@ -604,10 +608,22 @@ impl MetalRenderer {
 
         let instance_buffer_pool = self.instance_buffer_pool.clone();
         let instance_buffer = Cell::new(Some(writer.finish()));
+        // Surfaces stay retained until the GPU is done sampling them, so a
+        // producer that recycles its pixel buffers once only it holds them
+        // never overwrites one a frame is still reading.
+        let surfaces = Cell::new(Some((
+            scene
+                .surfaces
+                .iter()
+                .map(|surface| surface.image_buffer.clone())
+                .collect::<Vec<_>>(),
+            mem::take(&mut self.surface_textures),
+        )));
         let block = RcBlock::new(move |_: ptr::NonNull<AnyObject>| {
             if let Some(instance_buffer) = instance_buffer.take() {
                 instance_buffer_pool.lock().release(instance_buffer);
             }
+            drop(surfaces.take());
         });
         // SAFETY: Both pointee types are opaque views of the same Objective-C block pointer ABI.
         unsafe {
@@ -1295,8 +1311,7 @@ impl MetalRenderer {
                 });
             };
 
-            // Held until the draw is encoded: the encoder only borrows them.
-            let _textures: smallvec::SmallVec<[CFRetained<CVMetalTexture>; 2]> =
+            let textures: smallvec::SmallVec<[CFRetained<CVMetalTexture>; 2]> =
                 match CVPixelBufferGetPixelFormatType(image_buffer) {
                     format if format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange => {
                         command_encoder.set_render_pipeline_state(&self.surfaces_pipeline_state);
@@ -1337,6 +1352,7 @@ impl MetalRenderer {
                 1,
                 (first_surface + index) as u64,
             );
+            self.surface_textures.extend(textures);
         }
     }
 }
