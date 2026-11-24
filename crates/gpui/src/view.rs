@@ -321,6 +321,10 @@ impl<V: View> IntoElement for ViewElement<V> {
 }
 
 struct ViewElementState {
+    /// The frame the ranges below index into. A view nested in a cached view
+    /// that replayed whole wasn't visited that frame, so its ranges still
+    /// point into an older one and can't be replayed.
+    frame: u64,
     prepaint_range: Range<PrepaintStateIndex>,
     paint_range: Range<PaintIndex>,
     cache_key: ViewElementCacheKey,
@@ -547,6 +551,7 @@ fn prepaint_view(
                     && element_state.cache_key.bounds == bounds
                     && element_state.cache_key.content_mask == content_mask
                     && element_state.cache_key.text_style == text_style
+                    && element_state.frame + 1 == window.frames_drawn
                     && !window.dirty_views.contains(&entity_id)
                     && !window.refreshing
                 {
@@ -555,7 +560,19 @@ fn prepaint_view(
                     cx.entities
                         .extend_accessed(&element_state.accessed_entities);
                     let prepaint_end = window.prepaint_index();
-                    element_state.prepaint_range = prepaint_start..prepaint_end;
+                    let replayed = prepaint_start..prepaint_end;
+                    rebase_nested_views(window, &replayed, |nested| {
+                        nested.prepaint_range = nested
+                            .prepaint_range
+                            .start
+                            .rebase(&element_state.prepaint_range.start, &replayed.start)
+                            ..nested
+                                .prepaint_range
+                                .end
+                                .rebase(&element_state.prepaint_range.start, &replayed.start);
+                    });
+                    element_state.frame = window.frames_drawn;
+                    element_state.prepaint_range = replayed;
                     window.record_cached_view_reads(entity_id, &element_state.accessed_entities);
 
                     return (None, element_state);
@@ -579,6 +596,7 @@ fn prepaint_view(
                 (
                     Some(element),
                     ViewElementState {
+                        frame: window.frames_drawn,
                         accessed_entities,
                         prepaint_range: prepaint_start..prepaint_end,
                         paint_range: PaintIndex::default()..PaintIndex::default(),
@@ -592,6 +610,64 @@ fn prepaint_view(
             },
         )
     })
+}
+
+/// Carry the cached views nested in a block of the last frame that was just
+/// replayed into this one: they weren't visited, so their recorded ranges
+/// still index the last frame. `rebase` moves them to where the replay put
+/// their part of the block. Their element states are found through the
+/// block's own record of the states it accessed.
+fn rebase_nested_views(
+    window: &mut Window,
+    replayed: &Range<PrepaintStateIndex>,
+    rebase: impl FnMut(&mut ViewElementState),
+) {
+    let accessed = replayed.start.accessed_element_states_index()
+        ..replayed.end.accessed_element_states_index();
+    rebase_nested(window, accessed, true, rebase);
+}
+
+/// As [`rebase_nested_views`], for a replayed paint block.
+fn rebase_nested_views_painted(
+    window: &mut Window,
+    replayed: &Range<PaintIndex>,
+    rebase: impl FnMut(&mut ViewElementState),
+) {
+    let accessed = replayed.start.accessed_element_states_index()
+        ..replayed.end.accessed_element_states_index();
+    rebase_nested(window, accessed, false, rebase);
+}
+
+fn rebase_nested(
+    window: &mut Window,
+    accessed: Range<usize>,
+    stamp: bool,
+    mut rebase: impl FnMut(&mut ViewElementState),
+) {
+    let view_state = TypeId::of::<ViewElementState>();
+    let frame = window.frames_drawn;
+    let Window {
+        next_frame,
+        rendered_frame,
+        ..
+    } = window;
+    for key in &next_frame.accessed_element_states[accessed] {
+        if key.1 != view_state {
+            continue;
+        }
+        let Some(state) = rendered_frame
+            .element_states
+            .get_mut(key)
+            .and_then(|state| state.inner.downcast_mut::<Option<ViewElementState>>())
+            .and_then(Option::as_mut)
+        else {
+            continue;
+        };
+        rebase(state);
+        if stamp {
+            state.frame = frame;
+        }
+    }
 }
 
 #[inline(never)]
@@ -632,6 +708,12 @@ fn paint_view(
                         window.refreshing = refreshing;
                     } else {
                         window.reuse_paint(element_state.paint_range.clone());
+                        let old = element_state.paint_range.start.clone();
+                        let replayed = paint_start.clone()..window.paint_index();
+                        rebase_nested_views_painted(window, &replayed, |nested| {
+                            nested.paint_range = nested.paint_range.start.rebase(&old, &paint_start)
+                                ..nested.paint_range.end.rebase(&old, &paint_start);
+                        });
                     }
 
                     let paint_end = window.paint_index();

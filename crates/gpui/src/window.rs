@@ -1046,7 +1046,7 @@ pub(crate) struct Frame {
     pub(crate) focus: Option<FocusId>,
     pub(crate) window_active: bool,
     pub(crate) element_states: FxHashMap<(GlobalElementId, TypeId), ElementStateBox>,
-    accessed_element_states: Vec<(GlobalElementId, TypeId)>,
+    pub(crate) accessed_element_states: Vec<(GlobalElementId, TypeId)>,
     pub(crate) mouse_listeners: Vec<Option<AnyMouseListener>>,
     pub(crate) dispatch_tree: DispatchTree,
     pub(crate) scene: Scene,
@@ -1080,6 +1080,89 @@ pub(crate) struct PrepaintStateIndex {
     dispatch_tree_index: usize,
     accessed_element_states_index: usize,
     line_layout_index: LineLayoutIndex,
+}
+
+impl PrepaintStateIndex {
+    pub(crate) fn accessed_element_states_index(&self) -> usize {
+        self.accessed_element_states_index
+    }
+
+    /// `self`, recorded inside a block that started at `from`, for the copy
+    /// of that block replayed to start at `to`. Replaying copies every list
+    /// in order, so each index moves by its block's offset.
+    pub(crate) fn rebase(&self, from: &Self, to: &Self) -> Self {
+        let shift = |i: usize, f: usize, t: usize| i - f + t;
+        Self {
+            hitboxes_index: shift(self.hitboxes_index, from.hitboxes_index, to.hitboxes_index),
+            tooltips_index: shift(self.tooltips_index, from.tooltips_index, to.tooltips_index),
+            deferred_draws_index: shift(
+                self.deferred_draws_index,
+                from.deferred_draws_index,
+                to.deferred_draws_index,
+            ),
+            dispatch_tree_index: shift(
+                self.dispatch_tree_index,
+                from.dispatch_tree_index,
+                to.dispatch_tree_index,
+            ),
+            accessed_element_states_index: shift(
+                self.accessed_element_states_index,
+                from.accessed_element_states_index,
+                to.accessed_element_states_index,
+            ),
+            line_layout_index: self
+                .line_layout_index
+                .rebase(&from.line_layout_index, &to.line_layout_index),
+        }
+    }
+}
+
+impl PaintIndex {
+    pub(crate) fn accessed_element_states_index(&self) -> usize {
+        self.accessed_element_states_index
+    }
+
+    /// As [`PrepaintStateIndex::rebase`], for a replayed paint block.
+    pub(crate) fn rebase(&self, from: &Self, to: &Self) -> Self {
+        let shift = |i: usize, f: usize, t: usize| i - f + t;
+        Self {
+            scene_index: shift(self.scene_index, from.scene_index, to.scene_index),
+            #[cfg(any(test, feature = "test-support"))]
+            debug_bounds_index: shift(
+                self.debug_bounds_index,
+                from.debug_bounds_index,
+                to.debug_bounds_index,
+            ),
+            mouse_listeners_index: shift(
+                self.mouse_listeners_index,
+                from.mouse_listeners_index,
+                to.mouse_listeners_index,
+            ),
+            input_handlers_index: shift(
+                self.input_handlers_index,
+                from.input_handlers_index,
+                to.input_handlers_index,
+            ),
+            cursor_styles_index: shift(
+                self.cursor_styles_index,
+                from.cursor_styles_index,
+                to.cursor_styles_index,
+            ),
+            accessed_element_states_index: shift(
+                self.accessed_element_states_index,
+                from.accessed_element_states_index,
+                to.accessed_element_states_index,
+            ),
+            tab_handle_index: shift(
+                self.tab_handle_index,
+                from.tab_handle_index,
+                to.tab_handle_index,
+            ),
+            line_layout_index: self
+                .line_layout_index
+                .rebase(&from.line_layout_index, &to.line_layout_index),
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -1299,6 +1382,8 @@ pub struct Window {
     long_press_timer: Option<Task<()>>,
     long_press_capture: Option<EntityId>,
     pub(crate) refreshing: bool,
+    /// Frames drawn so far; a cached view's ranges are only valid in the next.
+    pub(crate) frames_drawn: u64,
     pub(crate) activation_observers: SubscriberSet<(), AnyObserver>,
     pub(crate) focus: Option<FocusId>,
     focus_enabled: bool,
@@ -2204,6 +2289,7 @@ impl Window {
             long_press_timer: None,
             long_press_capture: None,
             refreshing: false,
+            frames_drawn: 0,
             activation_observers: SubscriberSet::new(),
             focus: None,
             focus_enabled: true,
@@ -3536,6 +3622,7 @@ impl Window {
         let previous_focus_path = self.rendered_frame.focus_path();
         let previous_window_active = self.rendered_frame.window_active;
         mem::swap(&mut self.rendered_frame, &mut self.next_frame);
+        self.frames_drawn += 1;
         self.next_frame.clear();
         let current_focus_path = self.rendered_frame.focus_path();
         let current_window_active = self.rendered_frame.window_active;
@@ -10004,6 +10091,93 @@ mod inspector_tests {
         assert_eq!(renders(cx), (3, 2), "a notified inner view dirties both");
     }
 
+    /// A nested cached view isn't visited while its parent replays whole, so
+    /// its ranges are carried along with the replay. When the parent next
+    /// re-renders, the nested view replays from where they now point, even
+    /// after the content ahead of it shrank.
+    #[gpui::test]
+    fn test_nested_cached_view_replays_after_its_parent_replayed(cx: &mut TestAppContext) {
+        let model = cx.new(|_| 0u32);
+        let lines = Rc::new(Cell::new(8usize));
+        let window = cx.add_window({
+            let model = model.clone();
+            let lines = lines.clone();
+            move |_, cx| TextRoot {
+                lines,
+                outer: cx.new(|cx| NestOuter {
+                    model,
+                    inner: cx.new(|_| NestInner { renders: 0 }),
+                    renders: 0,
+                }),
+            }
+        });
+        let draw = |cx: &mut TestAppContext| {
+            cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+                .unwrap()
+        };
+        let inner_renders = |cx: &mut TestAppContext| {
+            let root = window.root(cx).unwrap();
+            cx.read(|cx| root.read(cx).outer.read(cx).inner.read(cx).renders)
+        };
+        let quads = |cx: &mut TestAppContext| {
+            cx.update_window(window.into(), |_, window, _| window.painted_quads().len())
+                .unwrap()
+        };
+
+        draw(cx);
+        let painted = quads(cx);
+        // Fewer lines ahead of the plot: everything after them shifts down,
+        // and the outer view, clean, replays whole.
+        lines.set(0);
+        window.update(cx, |_, _, cx| cx.notify()).unwrap();
+        draw(cx);
+        assert_eq!(inner_renders(cx), 1);
+
+        model.update(cx, |n, cx| {
+            *n += 1;
+            cx.notify();
+        });
+        draw(cx);
+        assert_eq!(inner_renders(cx), 1, "the inner view replays");
+        assert_eq!(quads(cx), painted, "and still paints");
+
+        lines.set(5);
+        window.update(cx, |_, _, cx| cx.notify()).unwrap();
+        model.update(cx, |n, cx| {
+            *n += 1;
+            cx.notify();
+        });
+        draw(cx);
+        assert_eq!(
+            inner_renders(cx),
+            1,
+            "through content growing ahead of it too"
+        );
+        assert_eq!(quads(cx), painted);
+    }
+
+    struct TextRoot {
+        lines: Rc<Cell<usize>>,
+        outer: Entity<NestOuter>,
+    }
+
+    impl Render for TextRoot {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .relative()
+                // Out of flow, so the cached view keeps its bounds.
+                .children(
+                    (0..self.lines.get())
+                        .map(|i| div().absolute().top_0().left_0().child(format!("line {i}"))),
+                )
+                .child(
+                    self.outer
+                        .clone()
+                        .cached(StyleRefinement::default().size(px(50.))),
+                )
+        }
+    }
+
     struct NestRoot {
         outer: Entity<NestOuter>,
     }
@@ -10026,14 +10200,11 @@ mod inspector_tests {
         fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             self.renders += 1;
             let n = *self.model.read(cx);
-            div()
-                .size(px(n as f32 + 20.))
-                .bg(crate::red())
-                .child(
-                    self.inner
-                        .clone()
-                        .cached(StyleRefinement::default().size(px(10.))),
-                )
+            div().size(px(n as f32 + 20.)).bg(crate::red()).child(
+                self.inner
+                    .clone()
+                    .cached(StyleRefinement::default().size(px(10.))),
+            )
         }
     }
 
@@ -10044,7 +10215,7 @@ mod inspector_tests {
     impl Render for NestInner {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             self.renders += 1;
-            div().size(px(10.)).bg(crate::blue())
+            div().size(px(10.)).bg(crate::blue()).child("inner")
         }
     }
 
