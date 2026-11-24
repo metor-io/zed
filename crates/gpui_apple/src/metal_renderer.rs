@@ -1836,4 +1836,87 @@ mod tests {
             assert_eq!(*alpha, 255);
         }
     }
+
+    /// A BGRA surface draws its pixels as stored, keeps their alpha, and
+    /// clips to its content mask. The headless target clears to opaque
+    /// black: the right half is white at alpha 0, so it must not show, and
+    /// the mask cuts off the bottom half of the opaque red on the left.
+    #[test]
+    fn render_bgra_surface() {
+        use objc2_core_video::{CVPixelBufferGetBaseAddress, CVPixelBufferGetBytesPerRow};
+
+        let attributes = CFDictionary::from_slices(
+            &[unsafe { kCVPixelBufferIOSurfacePropertiesKey }],
+            &[&*CFDictionary::<CFType, CFType>::empty()],
+        );
+        let mut image_buffer = ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                CVPixelBufferCreate(
+                    None,
+                    16,
+                    16,
+                    kCVPixelFormatType_32BGRA,
+                    Some(attributes.as_opaque()),
+                    ptr::NonNull::from(&mut image_buffer),
+                )
+            },
+            kCVReturnSuccess
+        );
+        let image_buffer =
+            unsafe { CFRetained::from_raw(ptr::NonNull::new(image_buffer).unwrap()) };
+        unsafe {
+            assert_eq!(
+                CVPixelBufferLockBaseAddress(&image_buffer, CVPixelBufferLockFlags::empty()),
+                kCVReturnSuccess
+            );
+            let base = CVPixelBufferGetBaseAddress(&image_buffer).cast::<u8>();
+            let stride = CVPixelBufferGetBytesPerRow(&image_buffer);
+            for row in 0..16 {
+                let line = slice::from_raw_parts_mut(base.add(row * stride), 16 * 4);
+                for (col, px) in line.chunks_exact_mut(4).enumerate() {
+                    px.copy_from_slice(if col < 8 {
+                        &[0x10, 0x20, 0xf0, 0xff]
+                    } else {
+                        &[0xff, 0xff, 0xff, 0]
+                    });
+                }
+            }
+            assert_eq!(
+                CVPixelBufferUnlockBaseAddress(&image_buffer, CVPixelBufferLockFlags::empty()),
+                kCVReturnSuccess
+            );
+        }
+
+        let bounds = Bounds {
+            origin: Point::default(),
+            size: size(ScaledPixels(16.0), ScaledPixels(16.0)),
+        };
+        let mask = Bounds {
+            origin: Point::default(),
+            size: size(ScaledPixels(16.0), ScaledPixels(8.0)),
+        };
+        let mut scene = Scene::default();
+        scene.insert_primitive(PaintSurface {
+            order: 0,
+            bounds,
+            content_mask: ContentMask { bounds: mask },
+            image_buffer: image_buffer.clone(),
+        });
+        drop(image_buffer);
+        scene.finish();
+
+        let mut renderer = MetalRenderer::new_headless(Arc::new(Mutex::new(Default::default())));
+        let image = renderer
+            .render_scene_to_image(&scene, size(DevicePixels(16), DevicePixels(16)))
+            .unwrap();
+        for (x, y, &image::Rgba(px)) in image.enumerate_pixels() {
+            let expected = if y < 8 && x < 8 {
+                [0xf0, 0x20, 0x10, 0xff]
+            } else {
+                [0, 0, 0, 0xff]
+            };
+            assert_eq!(px, expected, "pixel ({x}, {y})");
+        }
+    }
 }
