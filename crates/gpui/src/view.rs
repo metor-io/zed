@@ -561,7 +561,10 @@ fn prepaint_view(
                     return (None, element_state);
                 }
 
-                let refreshing = mem::replace(&mut window.refreshing, true);
+                // Clean cached views nested in this one keep their cache: a
+                // dirty descendant has already marked every view on its path
+                // dirty, so whatever is still clean replays its last frame,
+                // exactly as it would under an uncached parent.
                 let prepaint_start = window.prepaint_index();
                 let (element, accessed_entities) = cx.detect_accessed_entities(|cx| {
                     let mut element = render(window, cx);
@@ -571,7 +574,6 @@ fn prepaint_view(
                 });
 
                 let prepaint_end = window.prepaint_index();
-                window.refreshing = refreshing;
                 window.record_cached_view_reads(entity_id, &accessed_entities);
 
                 (

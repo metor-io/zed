@@ -9949,6 +9949,105 @@ mod inspector_tests {
         );
     }
 
+    /// A cached view re-rendering because an entity it read notified keeps
+    /// the clean cached views nested in it: they replay their last frame
+    /// rather than rendering again, and still paint.
+    #[gpui::test]
+    fn test_dirty_cached_view_reuses_clean_nested_views(cx: &mut TestAppContext) {
+        let model = cx.new(|_| 0u32);
+        let window = cx.add_window({
+            let model = model.clone();
+            move |_, cx| NestRoot {
+                outer: cx.new(|cx| NestOuter {
+                    model,
+                    inner: cx.new(|_| NestInner { renders: 0 }),
+                    renders: 0,
+                }),
+            }
+        });
+        let renders = |cx: &mut TestAppContext| {
+            let root = window.root(cx).unwrap();
+            cx.read(|cx| {
+                let outer = root.read(cx).outer.read(cx);
+                (outer.renders, outer.inner.read(cx).renders)
+            })
+        };
+        let draw = |cx: &mut TestAppContext| {
+            cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+                .unwrap()
+        };
+        let quads = |cx: &mut TestAppContext| {
+            cx.update_window(window.into(), |_, window, _| window.painted_quads().len())
+                .unwrap()
+        };
+
+        draw(cx);
+        assert_eq!(renders(cx), (1, 1));
+        let painted = quads(cx);
+        assert_eq!(painted, 2, "outer and inner each paint a quad");
+
+        model.update(cx, |n, cx| {
+            *n += 1;
+            cx.notify();
+        });
+        draw(cx);
+        assert_eq!(renders(cx), (2, 1), "only the outer view renders again");
+        assert_eq!(quads(cx), painted, "the reused inner view still paints");
+
+        window
+            .update(cx, |root, _, cx| {
+                root.outer
+                    .update(cx, |outer, cx| outer.inner.update(cx, |_, cx| cx.notify()))
+            })
+            .unwrap();
+        draw(cx);
+        assert_eq!(renders(cx), (3, 2), "a notified inner view dirties both");
+    }
+
+    struct NestRoot {
+        outer: Entity<NestOuter>,
+    }
+
+    impl Render for NestRoot {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            self.outer
+                .clone()
+                .cached(StyleRefinement::default().size(px(50.)))
+        }
+    }
+
+    struct NestOuter {
+        model: Entity<u32>,
+        inner: Entity<NestInner>,
+        renders: usize,
+    }
+
+    impl Render for NestOuter {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            self.renders += 1;
+            let n = *self.model.read(cx);
+            div()
+                .size(px(n as f32 + 20.))
+                .bg(crate::red())
+                .child(
+                    self.inner
+                        .clone()
+                        .cached(StyleRefinement::default().size(px(10.))),
+                )
+        }
+    }
+
+    struct NestInner {
+        renders: usize,
+    }
+
+    impl Render for NestInner {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            self.renders += 1;
+            div().size(px(10.)).bg(crate::blue())
+        }
+    }
+
     struct ReadsRoot {
         reader: Entity<ModelReader>,
         other: Entity<ModelReader>,
