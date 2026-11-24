@@ -556,6 +556,7 @@ fn prepaint_view(
                         .extend_accessed(&element_state.accessed_entities);
                     let prepaint_end = window.prepaint_index();
                     element_state.prepaint_range = prepaint_start..prepaint_end;
+                    window.record_cached_view_reads(entity_id, &element_state.accessed_entities);
 
                     return (None, element_state);
                 }
@@ -571,6 +572,7 @@ fn prepaint_view(
 
                 let prepaint_end = window.prepaint_index();
                 window.refreshing = refreshing;
+                window.record_cached_view_reads(entity_id, &accessed_entities);
 
                 (
                     Some(element),

@@ -1065,6 +1065,11 @@ pub(crate) struct Frame {
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub(crate) inspector_hitboxes: FxHashMap<HitboxId, crate::InspectorElementId>,
     pub(crate) tab_stops: TabStopMap,
+    /// For each entity a cached view read while rendering, the cached views
+    /// that read it. A notify on the entity invalidates them too, so a cached
+    /// view stays current with every entity it renders from, not only its
+    /// own (`Window::invalidate_entities`).
+    pub(crate) cached_view_reads: FxHashMap<EntityId, SmallVec<[EntityId; 2]>>,
 }
 
 #[derive(Clone, Default)]
@@ -1124,6 +1129,7 @@ impl Frame {
             #[cfg(any(feature = "inspector", debug_assertions))]
             inspector_hitboxes: FxHashMap::default(),
             tab_stops: TabStopMap::default(),
+            cached_view_reads: FxHashMap::default(),
         }
     }
 
@@ -1140,6 +1146,7 @@ impl Frame {
         self.window_control_hitboxes.clear();
         self.deferred_draws.clear();
         self.tab_stops.clear();
+        self.cached_view_reads.clear();
         self.focus = None;
 
         #[cfg(any(test, feature = "test-support"))]
@@ -3614,8 +3621,34 @@ impl Window {
         let mut views = self.invalidator.take_views();
         for entity in views.drain() {
             self.mark_view_dirty(entity);
+            let readers = self
+                .rendered_frame
+                .cached_view_reads
+                .get(&entity)
+                .cloned()
+                .unwrap_or_default();
+            for view in readers {
+                self.mark_view_dirty(view);
+            }
         }
         self.invalidator.replace_views(views);
+    }
+
+    /// Record that the cached view `view` read `entities` while rendering.
+    pub(crate) fn record_cached_view_reads(
+        &mut self,
+        view: EntityId,
+        entities: &FxHashSet<EntityId>,
+    ) {
+        for &entity in entities {
+            if entity != view {
+                self.next_frame
+                    .cached_view_reads
+                    .entry(entity)
+                    .or_default()
+                    .push(view);
+            }
+        }
     }
 
     #[profiling::function]
@@ -9863,6 +9896,90 @@ mod inspector_tests {
                 .update(cx, |_, window, cx| window.toggle_inspector(cx))
                 .expect("close inspector");
             assert_closed_inspector(windows[0].into(), cx);
+        }
+    }
+
+    /// A cached view re-renders when an entity it read notifies, even one
+    /// that isn't a view; a cached sibling that never read it stays cached,
+    /// and a draw with nothing notified reuses both.
+    #[gpui::test]
+    fn test_cached_view_follows_entities_it_reads(cx: &mut TestAppContext) {
+        let model = cx.new(|_| 0u32);
+        let window = cx.add_window({
+            let model = model.clone();
+            move |_, cx| {
+                let unrelated = cx.new(|_| 0u32);
+                ReadsRoot {
+                    reader: cx.new(|_| ModelReader { model, renders: 0 }),
+                    other: cx.new(|_| ModelReader {
+                        model: unrelated,
+                        renders: 0,
+                    }),
+                }
+            }
+        });
+        let renders = |cx: &mut TestAppContext| {
+            let root = window.root(cx).unwrap();
+            cx.read(|cx| {
+                let root = root.read(cx);
+                (root.reader.read(cx).renders, root.other.read(cx).renders)
+            })
+        };
+        let draw = |cx: &mut TestAppContext| {
+            cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+                .unwrap()
+        };
+
+        draw(cx);
+        let first = renders(cx);
+        assert_eq!(first, (1, 1));
+
+        draw(cx);
+        assert_eq!(renders(cx), first, "nothing notified, both reused");
+
+        model.update(cx, |n, cx| {
+            *n += 1;
+            cx.notify();
+        });
+        draw(cx);
+        assert_eq!(
+            renders(cx),
+            (2, 1),
+            "only the reader of the model re-renders"
+        );
+    }
+
+    struct ReadsRoot {
+        reader: Entity<ModelReader>,
+        other: Entity<ModelReader>,
+    }
+
+    impl Render for ReadsRoot {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .child(
+                    self.reader
+                        .clone()
+                        .cached(StyleRefinement::default().size(px(10.))),
+                )
+                .child(
+                    self.other
+                        .clone()
+                        .cached(StyleRefinement::default().size(px(10.))),
+                )
+        }
+    }
+
+    struct ModelReader {
+        model: Entity<u32>,
+        renders: usize,
+    }
+
+    impl Render for ModelReader {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            self.renders += 1;
+            let n = *self.model.read(cx);
+            div().size(px(n as f32 + 1.))
         }
     }
 
