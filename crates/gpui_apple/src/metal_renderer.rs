@@ -13,7 +13,7 @@ use objc2::{
     rc::Retained,
     runtime::{AnyObject, ProtocolObject},
 };
-use objc2_metal_performance_shaders::{MPSImageEdgeMode, MPSImageGaussianBlur};
+use objc2_metal_performance_shaders::{MPSImageEdgeMode, MPSImageGaussianBlur, MPSOffset};
 
 use core_graphics::color_space::{CGColorSpace, kCGColorSpaceDisplayP3};
 use foreign_types::{ForeignType, ForeignTypeRef};
@@ -937,7 +937,16 @@ impl MetalRenderer {
             // SAFETY: metal-rs and objc2-metal wrap the same Objective-C
             // objects, which stay alive for the call; the command buffer
             // retains both textures until it completes.
+            //
+            // MPS reads the source at `offset + (dest - clipRect.origin)`, so
+            // the offset must match the clip origin for the blur to land on
+            // what it blurs.
             unsafe {
+                kernel.setOffset(MPSOffset {
+                    x: region.origin.x.0 as isize,
+                    y: region.origin.y.0 as isize,
+                    z: 0,
+                });
                 kernel.setClipRect(objc2_metal::MTLRegion {
                     origin: objc2_metal::MTLOrigin {
                         x: region.origin.x.0 as usize,
@@ -2261,6 +2270,46 @@ mod tests {
         // The rounded corner leaves the very corner of the bounds unblurred.
         let image::Rgba([corner, ..]) = *image.get_pixel(16, 16);
         assert_eq!(corner, stripe(16));
+    }
+
+    /// The blur shows what is behind it in place: a lone white square under
+    /// an offset blur region stays where it was, just soft. Stripes can't
+    /// catch a misplaced blur; they look the same shifted by their period.
+    #[test]
+    fn backdrop_blur_stays_in_place() {
+        let (width, height) = (320., 200.);
+        let mask = ContentMask {
+            bounds: rect(0., 0., width, height),
+        };
+        let mut scene = Scene::default();
+        let mut square = solid_quad(rect(120., 80., 20., 20.), gpui::white());
+        square.content_mask = mask;
+        scene.insert_primitive(square);
+        scene.insert_primitive(BackdropBlur {
+            order: 0,
+            bounds: rect(60., 40., 200., 140.),
+            content_mask: mask,
+            corner_radii: Corners::default(),
+            sigma: ScaledPixels(3.),
+            opacity: 1.,
+        });
+        scene.finish();
+
+        let mut renderer = MetalRenderer::new_headless(Arc::new(Mutex::new(Default::default())));
+        let image = renderer
+            .render_scene_to_image(&scene, size(DevicePixels(320), DevicePixels(200)))
+            .unwrap();
+        let red = |x, y| image.get_pixel(x, y).0[0];
+        assert!(red(130, 90) > 200, "square center = {}", red(130, 90));
+        for (x, y) in [(200, 150), (250, 170), (70, 50), (240, 60)] {
+            assert!(
+                red(x, y) < 10,
+                "away from the square ({x}, {y}) = {}",
+                red(x, y)
+            );
+        }
+        // Soft edge: just outside the square picks up some of it.
+        assert!((10..200).contains(&red(142, 90)), "edge = {}", red(142, 90));
     }
 
     /// Two blurs in one batch share a single composite pass and each still
