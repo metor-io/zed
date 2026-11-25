@@ -13,7 +13,7 @@ use objc2::{
     rc::Retained,
     runtime::{AnyObject, ProtocolObject},
 };
-use objc2_metal_performance_shaders::{MPSImageEdgeMode, MPSImageGaussianBlur, MPSOffset};
+use objc2_metal_performance_shaders::{MPSImageEdgeMode, MPSImageGaussianBlur};
 
 use core_graphics::color_space::{CGColorSpace, kCGColorSpaceDisplayP3};
 use foreign_types::{ForeignType, ForeignTypeRef};
