@@ -943,11 +943,9 @@ fragment float4 backdrop_blur_fragment(
     texture2d<float> blurred [[texture(BackdropBlurInputIndex_Texture)]]) {
   constexpr sampler blur_sampler(mag_filter::nearest, min_filter::nearest,
                                  address::clamp_to_edge);
-  float2 source_origin =
-      float2(composite->source_origin.x, composite->source_origin.y);
   float2 source_size =
       float2(composite->source_size.x, composite->source_size.y);
-  float2 uv = (input.position.xy - source_origin) / source_size;
+  float2 uv = input.position.xy / source_size;
   float4 color = blurred.sample(blur_sampler, uv);
 
   float distance = quad_sdf(input.position.xy, composite->bounds,
