@@ -4845,6 +4845,43 @@ impl Window {
         }
     }
 
+    /// Blur whatever has already been painted behind `bounds` and composite it
+    /// back into the rounded rectangle, like CSS `backdrop-filter: blur()`.
+    /// `blur_radius` is the gaussian standard deviation, as in CSS. Paint a
+    /// translucent background afterwards to tint the result.
+    ///
+    /// Inside a [`Window::paint_layer`], everything in the layer shares one
+    /// draw order, so content painted earlier in the same layer is not blurred.
+    ///
+    /// Only the Metal renderer implements this; other renderers ignore it.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_backdrop_blur(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        blur_radius: Pixels,
+    ) {
+        self.invalidator.debug_assert_paint();
+        if !blur_radius.0.is_finite() || blur_radius <= Pixels::ZERO {
+            return;
+        }
+        let opacity = self.element_opacity();
+        if !opacity.is_finite() || opacity <= 0. {
+            return;
+        }
+
+        let scale_factor = self.scale_factor();
+        self.next_frame.scene.insert_primitive(crate::BackdropBlur {
+            order: 0,
+            bounds: self.snap_bounds(bounds),
+            content_mask: self.snapped_content_mask(),
+            corner_radii: corner_radii.scale(scale_factor),
+            sigma: blur_radius.scale(scale_factor),
+            opacity: opacity.min(1.),
+        });
+    }
+
     /// Paint one or more quads into the scene for the next frame at the current stacking context.
     /// Quads are colored rectangular regions with an optional background, border, and corner radius.
     /// see [`fill`], [`outline`], and [`quad`] to construct this type.

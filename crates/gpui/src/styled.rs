@@ -748,6 +748,14 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Blurs the content behind this element, like CSS `backdrop-filter: blur()`;
+    /// the radius is the gaussian standard deviation. Pair it with a translucent
+    /// [`Styled::bg`] to tint the frosted result. Metal only for now.
+    fn backdrop_blur(mut self, radius: impl Into<crate::Pixels>) -> Self {
+        self.style().backdrop_blur = Some(radius.into());
+        self
+    }
+
     /// Sets the grid columns of this element.
     fn grid_cols(mut self, cols: u16) -> Self {
         self.style().grid_cols = Some(GridTemplate {

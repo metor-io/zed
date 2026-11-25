@@ -235,6 +235,10 @@ name = "opacity"
 path = "examples/opacity.rs"
 
 [[example]]
+name = "backdrop_blur"
+path = "examples/backdrop_blur.rs"
+
+[[example]]
 name = "pattern"
 path = "examples/pattern.rs"
 

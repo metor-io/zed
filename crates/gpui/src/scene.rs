@@ -50,6 +50,7 @@ pub struct Scene {
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
+    pub backdrop_blurs: Vec<BackdropBlur>,
 }
 
 #[expect(missing_docs)]
@@ -66,6 +67,7 @@ impl Scene {
         self.subpixel_sprites.clear();
         self.polychrome_sprites.clear();
         self.surfaces.clear();
+        self.backdrop_blurs.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -94,11 +96,18 @@ impl Scene {
             return;
         }
 
+        // A backdrop blur samples a halo around its bounds, so it must order
+        // after everything painted beneath that halo, not just beneath its
+        // bounds.
+        let order_bounds = match &primitive {
+            Primitive::BackdropBlur(blur) => clipped_bounds.dilate(blur.sample_halo()),
+            _ => clipped_bounds,
+        };
         let order = self
             .layer_stack
             .last()
             .copied()
-            .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds));
+            .unwrap_or_else(|| self.primitive_bounds.insert(order_bounds));
         match &mut primitive {
             Primitive::Shadow(shadow) => {
                 shadow.order = order;
@@ -133,6 +142,10 @@ impl Scene {
                 surface.order = order;
                 self.surfaces.push(surface.clone());
             }
+            Primitive::BackdropBlur(blur) => {
+                blur.order = order;
+                self.backdrop_blurs.push(*blur);
+            }
         }
         self.paint_operations
             .push(PaintOperation::Primitive(primitive));
@@ -160,6 +173,7 @@ impl Scene {
         self.polychrome_sprites
             .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
         self.surfaces.sort_by_key(|surface| surface.order);
+        self.backdrop_blurs.sort_by_key(|blur| blur.order);
     }
 
     #[cfg_attr(
@@ -187,6 +201,8 @@ impl Scene {
             polychrome_sprites_iter: self.polychrome_sprites.iter().peekable(),
             surfaces_start: 0,
             surfaces_iter: self.surfaces.iter().peekable(),
+            backdrop_blurs_start: 0,
+            backdrop_blurs_iter: self.backdrop_blurs.iter().peekable(),
         }
     }
 }
@@ -201,6 +217,9 @@ impl Scene {
 )]
 pub(crate) enum PrimitiveKind {
     Shadow,
+    // Sorts before quads so that, within one layer, an element's blurred
+    // backdrop lands under its own (typically translucent) background.
+    BackdropBlur,
     #[default]
     Quad,
     Path,
@@ -228,6 +247,7 @@ pub enum Primitive {
     SubpixelSprite(SubpixelSprite),
     PolychromeSprite(PolychromeSprite),
     Surface(PaintSurface),
+    BackdropBlur(BackdropBlur),
 }
 
 #[expect(missing_docs)]
@@ -242,6 +262,7 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.bounds,
             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
             Primitive::Surface(surface) => &surface.bounds,
+            Primitive::BackdropBlur(blur) => &blur.bounds,
         }
     }
 
@@ -255,6 +276,7 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.content_mask,
             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
             Primitive::Surface(surface) => &surface.content_mask,
+            Primitive::BackdropBlur(blur) => &blur.content_mask,
         }
     }
 }
@@ -283,6 +305,8 @@ struct BatchIterator<'a> {
     polychrome_sprites_iter: Peekable<slice::Iter<'a, PolychromeSprite>>,
     surfaces_start: usize,
     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
+    backdrop_blurs_start: usize,
+    backdrop_blurs_iter: Peekable<slice::Iter<'a, BackdropBlur>>,
 }
 
 impl<'a> Iterator for BatchIterator<'a> {
@@ -315,6 +339,10 @@ impl<'a> Iterator for BatchIterator<'a> {
             (
                 self.surfaces_iter.peek().map(|s| s.order),
                 PrimitiveKind::Surface,
+            ),
+            (
+                self.backdrop_blurs_iter.peek().map(|b| b.order),
+                PrimitiveKind::BackdropBlur,
             ),
         ];
         orders_and_kinds.sort_by_key(|(order, kind)| (order.unwrap_or(u32::MAX), *kind));
@@ -461,6 +489,20 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.surfaces_start = surfaces_end;
                 Some(PrimitiveBatch::Surfaces(surfaces_start..surfaces_end))
             }
+            PrimitiveKind::BackdropBlur => {
+                let blurs_start = self.backdrop_blurs_start;
+                let mut blurs_end = blurs_start + 1;
+                self.backdrop_blurs_iter.next();
+                while self
+                    .backdrop_blurs_iter
+                    .next_if(|blur| (blur.order, batch_kind) < max_order_and_kind)
+                    .is_some()
+                {
+                    blurs_end += 1;
+                }
+                self.backdrop_blurs_start = blurs_end;
+                Some(PrimitiveBatch::BackdropBlurs(blurs_start..blurs_end))
+            }
         }
     }
 }
@@ -493,6 +535,7 @@ pub enum PrimitiveBatch {
         range: Range<usize>,
     },
     Surfaces(Range<usize>),
+    BackdropBlurs(Range<usize>),
 }
 
 impl PrimitiveBatch {
@@ -525,6 +568,7 @@ impl PrimitiveBatch {
                 )
             }
             Self::Surfaces(range) => format!("surfaces ({})", range.len()),
+            Self::BackdropBlurs(range) => format!("backdrop blurs ({})", range.len()),
         }
     }
 }
@@ -588,6 +632,39 @@ pub struct Shadow {
 impl From<Shadow> for Primitive {
     fn from(shadow: Shadow) -> Self {
         Primitive::Shadow(shadow)
+    }
+}
+
+/// Blurs whatever has already been painted behind `bounds` and composites the
+/// result back into the rounded rectangle, like CSS `backdrop-filter: blur()`.
+/// Elements usually paint a translucent background on top to tint it.
+#[derive(Debug, Copy, Clone)]
+pub struct BackdropBlur {
+    /// Draw order, assigned by the scene.
+    pub order: DrawOrder,
+    /// Region to blur, in device pixels.
+    pub bounds: Bounds<ScaledPixels>,
+    /// Clip applied to the composited result.
+    pub content_mask: ContentMask<ScaledPixels>,
+    /// Corner radii of the composited region.
+    pub corner_radii: Corners<ScaledPixels>,
+    /// Gaussian standard deviation in device pixels (CSS `blur()` semantics).
+    pub sigma: ScaledPixels,
+    /// Weight of the blurred result over the unblurred backdrop, so a fading
+    /// element fades its blur with it.
+    pub opacity: f32,
+}
+
+impl BackdropBlur {
+    /// How far outside `bounds` the blur kernel reads.
+    pub fn sample_halo(&self) -> ScaledPixels {
+        ScaledPixels((self.sigma.0 * 3.0).ceil())
+    }
+}
+
+impl From<BackdropBlur> for Primitive {
+    fn from(blur: BackdropBlur) -> Self {
+        Primitive::BackdropBlur(blur)
     }
 }
 

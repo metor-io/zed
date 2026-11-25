@@ -908,6 +908,55 @@ fragment float4 surface_bgra_fragment(SurfaceFragmentInput input [[stage_in]],
   return texture.sample(texture_sampler, input.texture_position);
 }
 
+struct BackdropBlurVertexOutput {
+  float4 position [[position]];
+  float clip_distance [[clip_distance]][4];
+};
+
+struct BackdropBlurFragmentInput {
+  float4 position [[position]];
+};
+
+vertex BackdropBlurVertexOutput backdrop_blur_vertex(
+    uint unit_vertex_id [[vertex_id]],
+    constant float2 *unit_vertices [[buffer(BackdropBlurInputIndex_Vertices)]],
+    constant BackdropBlurComposite *composite
+    [[buffer(BackdropBlurInputIndex_Composite)]],
+    constant Size_DevicePixels *viewport_size
+    [[buffer(BackdropBlurInputIndex_ViewportSize)]]) {
+  float2 unit_vertex = unit_vertices[unit_vertex_id];
+  float4 device_position =
+      to_device_position(unit_vertex, composite->bounds, viewport_size);
+  float4 clip_distance = distance_from_clip_rect(
+      unit_vertex, composite->bounds, composite->content_mask.bounds);
+  return BackdropBlurVertexOutput{
+      device_position,
+      {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
+}
+
+// Replaces the backdrop under the rounded rectangle with its blurred copy,
+// weighted by coverage and the element's opacity.
+fragment float4 backdrop_blur_fragment(
+    BackdropBlurFragmentInput input [[stage_in]],
+    constant BackdropBlurComposite *composite
+    [[buffer(BackdropBlurInputIndex_Composite)]],
+    texture2d<float> blurred [[texture(BackdropBlurInputIndex_Texture)]]) {
+  constexpr sampler blur_sampler(mag_filter::nearest, min_filter::nearest,
+                                 address::clamp_to_edge);
+  float2 source_origin =
+      float2(composite->source_origin.x, composite->source_origin.y);
+  float2 source_size =
+      float2(composite->source_size.x, composite->source_size.y);
+  float2 uv = (input.position.xy - source_origin) / source_size;
+  float4 color = blurred.sample(blur_sampler, uv);
+
+  float distance = quad_sdf(input.position.xy, composite->bounds,
+                            composite->corner_radii);
+  float coverage = saturate(0.5 - distance);
+  // The pipeline blends rgb by source alpha, so alpha is the mix weight.
+  return float4(color.rgb, coverage * composite->opacity);
+}
+
 float4 hsla_to_rgba(Hsla hsla) {
   float h = hsla.h * 6.0; // Now, it's an angle but scaled in [0, 6) range
   float s = hsla.s;
